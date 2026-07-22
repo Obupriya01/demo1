@@ -1,0 +1,126 @@
+name: Build, Dockerize, Publish, and Deploy to AWS in GitOps
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: deploy-${{github.repository}}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{vars.AWS_REGION}}
+  ECR_REPOSITORY: ${{vars.ECR_REPOSITORY}}
+  CALVIN_INSTANCE_ID: ${{vars.CALVIN_INSTANCE_ID}}
+  SSM_DOCUMENT: ${{vars.SSM_DOCUMENT}}
+
+jobs:
+  build-test-publish-deploy:
+    name: Build, dockerize, publish, and deploy to AWS
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Make Maven wrapper executable
+        run: chmod +x mvnw
+
+      - name: Build and test
+        run: ./mvnw --batch-mode clean verify
+
+      - name: Configure AWS credentials through OIDC
+        uses: aws-actions/configure-aws-credentials@v5
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Generate image references
+        id: image
+        env:
+          ECR_REGISTRY: ${{ steps.ecr-login.outputs.registry }}
+        run: |
+          set -euo pipefail
+          
+          IMAGE_SHA="${ECR_REGISTRY}/${ECR_REPOSITORY}:${GITHUB_SHA}"
+          IMAGE_LATEST="${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+          
+          echo "sha=${IMAGE_SHA}" >> "$GITHUB_OUTPUT"
+          echo "latest=${IMAGE_LATEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Docker image
+        env:
+          IMAGE_SHA: ${{ steps.image.outputs.sha }}
+          IMAGE_LATEST: ${{ steps.image.outputs.latest }}
+        run: |
+          set -euo pipefail
+          
+          docker build --tag "$IMAGE_SHA" --tag "$IMAGE_LATEST" .
+
+      - name: Push Docker image to ECR
+        env:
+          IMAGE_SHA: ${{ steps.image.outputs.sha }}
+          IMAGE_LATEST: ${{ steps.image.outputs.latest }}
+        run: |
+          set -euo pipefail
+          
+          docker push "$IMAGE_SHA"
+          docker push "$IMAGE_LATEST"
+
+      - name: Deploy image to Grand Calvin
+        id: deploy
+        env:
+          IMAGE_URI: ${{ steps.image.outputs.sha }}
+        run: |
+          set -euo pipefail
+          
+          COMMAND_ID="$(
+                      aws ssm send-command \
+                        --region "$AWS_REGION" \
+                        --instance-ids "$CALVIN_INSTANCE_ID" \
+                        --document-name "$SSM_DOCUMENT" \
+                        --parameters "ImageUri=${IMAGE_URI}" \
+                        --query "Command.CommandId" \
+                        --output text
+                    )"
+          
+          echo "command-id=${COMMAND_ID}" >> "$GITHUB_OUTPUT"
+          
+          aws ssm wait command-executed \
+            --region "$AWS_REGION" \
+            --command-id "$COMMAND_ID" \
+            --instance-id "$CALVIN_INSTANCE_ID"
+          
+      - name: Display deployment result
+        if: always() && steps.deploy.outputs.command-id != ''
+        env:
+          COMMAND_ID: ${{steps.deploy.outputs.command-id}}
+        run: |
+          set -euo pipefail
+          
+          aws ssm get-command-invocation \
+                      --region "$AWS_REGION" \
+                      --command-id "$COMMAND_ID" \
+                      --instance-id "$CALVIN_INSTANCE_ID" \
+                      --query '{
+                        Status:Status,
+                        Output:StandardOutputContent,
+                        Error:StandardErrorContent
+                      }'
